@@ -3,7 +3,7 @@ from pathlib import Path
 BASE=Path(os.getenv('RIFT_BASE','/srv/rift')); RUN=Path(os.getenv('RIFT_RUN','/run/rift')); DATA=BASE/'servers'; ARCH=BASE/'backups'; DB=BASE/'panel.db'
 ID=re.compile(r'^[a-f0-9]{16}$'); VER=re.compile(r'^(1\.\d{2}(?:\.\d{1,2})?|\d{2}\.\d+(?:\.\d+)?)$'); NAME=re.compile(r'^[a-z][a-z0-9_]{2,31}$'); KINDS=('neoforge','paper','spigot','craftbukkit','vanilla')
 UA='RiftServerOS/1.0 (https://github.com/openai)'
-LOCK=threading.RLock(); ACTIVE=set(); _SAMPLE={}
+LOCK=threading.RLock(); ACTIVE=set(); ACTIONS={}; _SAMPLE={}
 def db():
     BASE.mkdir(parents=True,exist_ok=True)
     c=sqlite3.connect(DB,timeout=30,check_same_thread=False);DB.chmod(0o600);c.row_factory=sqlite3.Row;c.execute('PRAGMA journal_mode=WAL');return c
@@ -19,10 +19,31 @@ def get(sid):
     with db() as c:s=c.execute('SELECT * FROM servers WHERE id=?',(sid,)).fetchone()
     if s is None:raise ValueError('Server neexistuje')
     return dict(s)
-def running(sid):return (RUN/(sid+'.sock')).exists()
+def process_alive(sid):
+    """Check the Java child, not a possibly stale console socket."""
+    try:
+        pid=int((RUN/(sid+'.pid')).read_text())
+        if pid<=1:return False
+        proc=Path('/proc')/str(pid)
+        cmd=(proc/'cmdline').read_bytes().split(b'\0')
+        return any(arg.endswith(b'/bin/java') for arg in cmd) and (proc/'cwd').resolve()==(DATA/sid).resolve()
+    except (OSError,ValueError):return False
+def running(sid):return process_alive(sid)
+def service_state(sid):
+    try:
+        result=subprocess.run(['/usr/bin/systemctl','is-active','rift-mc@'+sid+'.service'],capture_output=True,text=True,timeout=3)
+        return result.stdout.strip()
+    except (OSError,subprocess.TimeoutExpired):return ''
+def server_status(sid):
+    with LOCK:action=ACTIONS.get(sid)
+    if action:return 'stopping' if action=='stop' else 'starting' if action=='start' else 'restarting'
+    if running(sid):return 'online'
+    if service_state(sid) in ('active','activating'):return 'starting'
+    return 'offline'
 def servers():
     with db() as c:rows=[dict(x) for x in c.execute('SELECT * FROM servers ORDER BY created DESC')]
-    for row in rows:row['running']=running(row['id'])
+    for row in rows:
+        row['status']=server_status(row['id']);row['running']=row['status']=='online'
     return rows
 def socket_call(path,obj,timeout=90):
     with socket.socket(socket.AF_UNIX) as sock:
@@ -49,6 +70,55 @@ def stop(sid):
 def start(sid):
     if get(sid)['state']!='ready':raise ValueError('Instalace ještě není dokončená')
     return privileged('service',name='rift-mc@'+sid+'.service',verb='start')
+def control(sid,verb):
+    if verb not in ('start','stop','restart'):raise ValueError('Neznámá akce')
+    s=get(sid)
+    with LOCK:
+        if sid in ACTIONS or sid in ACTIVE:raise ValueError('Na serveru již probíhá jiná akce')
+        state=server_status(sid)
+        if verb=='start' and (s['state']!='ready' or state!='offline'):raise ValueError('Server se již spouští nebo běží')
+        if verb!='start' and state=='offline':raise ValueError('Server neběží')
+        ACTIONS[sid]=verb
+    def work(jid):
+        try:
+            if verb!='start':stop(sid)
+            if verb!='stop':start(sid)
+        finally:
+            with LOCK:ACTIONS.pop(sid,None)
+    try:return {'job':job(verb,sid,work)}
+    except Exception:
+        with LOCK:ACTIONS.pop(sid,None)
+        raise
+def delete_server(sid,name,remove_backups=False):
+    s=get(sid)
+    if name!=s['name']:raise ValueError('Potvrď smazání přesným názvem serveru')
+    with LOCK:
+        if sid in ACTIONS or sid in ACTIVE or server_status(sid)!='offline':raise ValueError('Nejprve server zastav a dokonči běžící úlohy')
+        with db() as c:
+            if c.execute("SELECT 1 FROM jobs WHERE server=? AND state='running' LIMIT 1",(sid,)).fetchone():raise ValueError('Nejprve dokonči běžící úlohy')
+            profiles=[dict(r) for r in c.execute('SELECT id,destination FROM profiles WHERE server=?',(sid,))]
+        ACTIONS[sid]='delete'
+    try:
+        privileged('service',name='rift-mc@'+sid+'.service',verb='disable')
+        folder=DATA/sid
+        if folder.is_symlink():raise ValueError('Adresář serveru je symbolický odkaz')
+        if folder.exists():shutil.rmtree(folder)
+        (RUN/(sid+'.sock')).unlink(missing_ok=True)
+        (RUN/(sid+'.pid')).unlink(missing_ok=True)
+        if remove_backups:
+            for profile in profiles:
+                target=Path(profile['destination'])/sid
+                if target.is_dir() and not target.is_symlink():
+                    for archive in target.glob('*-'+profile['id']+'.tar.gz'):archive.unlink()
+                    if not any(target.iterdir()):target.rmdir()
+            for archive in ARCH.glob(sid+'-before-restore-*.tar.gz'):archive.unlink()
+        with db() as c:
+            c.execute('DELETE FROM profiles WHERE server=?',(sid,))
+            c.execute('DELETE FROM jobs WHERE server=?',(sid,))
+            c.execute('DELETE FROM servers WHERE id=?',(sid,))
+    finally:
+        with LOCK:ACTIONS.pop(sid,None)
+    return {'ok':True}
 def path(sid,rel):
     root=(DATA/get(sid)['id']).resolve(strict=True);p=(root/str(rel).lstrip('/')).resolve()
     if p!=root and root not in p.parents:raise ValueError('Cesta mimo server')
@@ -146,7 +216,7 @@ def install(jid,sid):
             if not item:raise RuntimeError('Mojang server pro tuto verzi nenabízí')
             fetch(item['url'],tmp/'server.jar')
             if hashlib.sha1((tmp/'server.jar').read_bytes()).hexdigest()!=item['sha1']:raise RuntimeError('Nesouhlasí SHA1 ze zdroje Mojang')
-        (tmp/'server.properties').write_text(f'server-port={s["port"]}\nenable-rcon=false\nenable-query=false\nonline-mode=true\n',encoding='utf8')
+        (tmp/'server.properties').write_text(f'server-port={s["port"]}\nmax-players=20\nenable-rcon=false\nenable-query=false\nonline-mode=true\n',encoding='utf8')
         (tmp/'eula.txt').write_text('eula=true\n');(tmp/'logs').mkdir(exist_ok=True);tmp.rename(dest)
         with db() as c:c.execute('UPDATE servers SET loader=?,state=? WHERE id=?',(loader,'ready',sid))
     except Exception:
@@ -233,7 +303,8 @@ def tasks():
                 for row in rest:c.execute('UPDATE servers SET next_restart=? WHERE id=?',(now+row['restart_hours']*3600,row['id']))
             for row in due:job('backup',row['server'],lambda j,p=row['id']:backup(j,p))
             for row in rest:
-                if running(row['id']):job('restart',row['id'],lambda j,s=row['id']:(stop(s),start(s)))
+                if running(row['id']):
+                    with contextlib.suppress(ValueError):control(row['id'],'restart')
         except Exception as exc:print('scheduler:',exc,flush=True)
         time.sleep(45)
 def status():
@@ -285,7 +356,13 @@ def process_metrics(sid):
 def players(sid):
     """Ask the server console for an authoritative list; no RCON port needed."""
     get(sid)
-    if not running(sid):return {'online':0,'max':None,'names':[]}
+    maximum=20
+    config=DATA/sid/'server.properties'
+    if config.is_file():
+        for line in config.read_text(encoding='utf8',errors='replace').splitlines():
+            if line.strip().startswith('max-players='):
+                with contextlib.suppress(ValueError):maximum=int(line.split('=',1)[1].strip())
+    if not running(sid):return {'online':0,'max':maximum,'names':[]}
     logfile=DATA/sid/'logs/console.log'
     before=logfile.stat().st_size if logfile.exists() else 0
     command(sid,'list')
@@ -300,4 +377,4 @@ def players(sid):
                 names=[x.strip() for x in raw.strip().split(',') if re.fullmatch(r'[A-Za-z0-9_]{3,16}',x.strip())]
                 return {'online':int(count),'max':int(total),'names':names}
         time.sleep(.25)
-    return {'online':None,'max':None,'names':[],'message':'Server neodpověděl na příkaz list'}
+    return {'online':None,'max':maximum,'names':[],'message':'Server neodpověděl na příkaz list'}

@@ -46,7 +46,7 @@ Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/run/rift /etc/fstab /mnt/rift-backups
+ReadWritePaths=/run/rift /srv/rift /etc/fstab /mnt/rift-backups
 PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
@@ -164,7 +164,7 @@ pasv_min_port=40000
 pasv_max_port=40100
 EOF
 # Debian installer target is chrooted; systemctl enable works there, start only after first boot.
-systemctl daemon-reload
+if [[ -d /run/systemd/system ]]; then systemctl daemon-reload; fi
 systemctl enable mariadb.service ssh.service rift-root.service rift-panel.service rift-kiosk.service
 systemctl disable vsftpd.service >/dev/null 2>&1 || true
 if [[ -d /run/systemd/system ]]; then

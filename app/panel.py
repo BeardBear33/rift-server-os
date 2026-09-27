@@ -111,7 +111,9 @@ class Handler(BaseHTTPRequestHandler):
         parts=p.strip('/').split('/')
         if len(parts)>=3 and parts[:2]==['api','server']:
             sid=parts[2];s=e.get(sid);tail='/'.join(parts[3:])
-            if tail=='':return self.json({**s,'running':e.running(sid)})
+            if tail=='':
+                state=e.server_status(sid)
+                return self.json({**s,'status':state,'running':state=='online'})
             if tail=='players':return self.json(e.players(sid))
             if tail=='process':return self.json(e.process_metrics(sid))
             if tail=='console':
@@ -122,10 +124,10 @@ class Handler(BaseHTTPRequestHandler):
             if tail=='command' and method=='POST':return self.json(e.command(sid,self.data().get('value','')))
             if tail=='action' and method=='POST':
                 verb=self.data().get('verb')
-                if verb=='start':return self.json(e.start(sid))
-                if verb=='stop':return self.json({'stopped':e.stop(sid)})
-                if verb=='restart':return self.json({'job':e.job('restart',sid,lambda j:(e.stop(sid),e.start(sid)))})
-                raise ValueError('Neznámá akce')
+                return self.json(e.control(sid,verb))
+            if tail=='delete' and method=='POST':
+                d=self.data()
+                return self.json(e.delete_server(sid,d.get('name'),d.get('remove_backups') is True))
             if tail=='autostart' and method=='POST':
                 enabled=bool(self.data().get('enabled'))
                 e.privileged('service',name='rift-mc@'+sid+'.service',verb='enable' if enabled else 'disable')
